@@ -151,7 +151,7 @@ jobs:
           echo "Release image: ${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
 
       - name: Fail on CRITICAL vulnerabilities in the exact release digest
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: quasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: ${{ steps.image.outputs.repository }}@${{ steps.release-image.outputs.digest }}
