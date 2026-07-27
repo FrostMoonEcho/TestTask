@@ -1,0 +1,94 @@
+# Safe chart defaults. Production overrides live in values.production.yaml.
+
+nameOverride: ""
+
+replicaCount: 1
+revisionHistoryLimit: 5
+
+image:
+  repository: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/cell-01/billing-service
+  tag: dev
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# The deploy workflow refreshes this short-lived ECR pull secret.
+imagePullSecrets:
+  - name: ecr-registry-credentials
+
+serviceAccount:
+  create: true
+  name: ""
+  automountServiceAccountToken: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 3000
+  targetPort: 3000
+
+env:
+  nodeEnv: development
+  pgSslMode: require
+  devExposeTokens: "false"
+  dbHost: postgres.invalid
+  dbPort: "5432"
+  dbName: billing
+  dbUser: billing_app
+
+postgres:
+  # Set this in production after creating a ConfigMap with the RDS CA bundle.
+  caConfigMapName: ""
+  caMountPath: /etc/rds-ca
+  caFileName: global-bundle.pem
+
+# Only Secret/key names are stored in Helm values. Secret values are supplied
+# out of band from AWS Secrets Manager or another approved secret controller.
+secrets:
+  existingSecret: billing-service-secrets
+  keys:
+    dbPassword: db-password
+    jwtSecret: jwt-secret
+    stripeKey: stripe-secret-key
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+probes:
+  startup:
+    path: /health
+    periodSeconds: 2
+    failureThreshold: 30
+  readiness:
+    path: /health
+    periodSeconds: 5
+    failureThreshold: 3
+  liveness:
+    path: /health
+    periodSeconds: 10
+    failureThreshold: 3
+
+networkPolicy:
+  enabled: true
+  apiGateway:
+    namespace: platform
+    podLabels:
+      app.kubernetes.io/name: api-gateway

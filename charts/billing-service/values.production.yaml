@@ -1,0 +1,56 @@
+# Production contains no secret values. CI supplies the immutable image tag,
+# and the existing Secret is reconciled from the approved secret store.
+
+replicaCount: 2
+revisionHistoryLimit: 10
+
+image:
+  tag: sha-placeholder
+  # CI resolves this after the immutable SHA tag is present in ECR.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+env:
+  nodeEnv: production
+  pgSslMode: verify-full
+  devExposeTokens: "false"
+  # CI/CD must inject the exact Terraform rds_endpoint output.
+  dbHost: ""
+  dbPort: "5432"
+  dbName: billing
+  dbUser: billing_app
+
+postgres:
+  caConfigMapName: rds-ca-bundle
+  caMountPath: /etc/rds-ca
+  caFileName: global-bundle.pem
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+networkPolicy:
+  enabled: true
+  apiGateway:
+    namespace: platform
+    podLabels:
+      app.kubernetes.io/name: api-gateway

@@ -1,0 +1,263 @@
+name: Build, scan, and deploy cell-01
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cell-01-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  HELM_RELEASE: billing-service
+  KUBE_NAMESPACE: cell-01
+
+jobs:
+  validate:
+    name: Validate application and Helm chart
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@v5.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Check Terraform formatting
+        run: terraform -chdir=terraform fmt -check -recursive
+
+      - name: Initialize Terraform without the remote backend
+        run: terraform -chdir=terraform init -backend=false -input=false
+
+      - name: Validate Terraform configuration
+        run: terraform -chdir=terraform validate
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4.3.1
+
+      - name: Lint production chart
+        run: >-
+          helm lint charts/billing-service
+          --values charts/billing-service/values.production.yaml
+          --set-string env.dbHost="validation.invalid"
+          --set-string image.tag="${GITHUB_SHA}"
+
+      - name: Render production chart
+        run: >-
+          helm template billing-service charts/billing-service
+          --namespace "${KUBE_NAMESPACE}"
+          --values charts/billing-service/values.production.yaml
+          --set-string env.dbHost="validation.invalid"
+          --set-string image.tag="${GITHUB_SHA}"
+          > /tmp/billing-service.yaml
+
+      - name: Reject plaintext secret values in rendered manifests
+        run: |
+          if grep -Eq 'change-me|super-secret|sk_test_' /tmp/billing-service.yaml; then
+            echo "Rendered manifests contain a forbidden placeholder secret."
+            exit 1
+          fi
+
+  build-and-push:
+    name: Build, scan, and push immutable image
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+      image_repository: ${{ steps.image.outputs.repository }}
+      image_tag: ${{ steps.image.outputs.tag }}
+      image_digest: ${{ steps.release-image.outputs.digest }}
+
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@v5.1.0
+
+      - name: Assume the ECR push role through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUSH_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}-build
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Define immutable image coordinates
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "repository=${ECR_REGISTRY}/${ECR_REPOSITORY}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build image
+        env:
+          IMAGE_REPOSITORY: ${{ steps.image.outputs.repository }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: docker build --tag "${IMAGE_REPOSITORY}:${IMAGE_TAG}" .
+
+      - name: Push image once
+        env:
+          IMAGE_REPOSITORY: ${{ steps.image.outputs.repository }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          if aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids "imageTag=${IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "Immutable image ${IMAGE_TAG} already exists; push is skipped."
+          else
+            docker push "${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+          fi
+
+      - name: Resolve the exact immutable ECR digest
+        id: release-image
+        env:
+          IMAGE_REPOSITORY: ${{ steps.image.outputs.repository }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          IMAGE_DIGEST="$(aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids "imageTag=${IMAGE_TAG}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+          test -n "${IMAGE_DIGEST}"
+          test "${IMAGE_DIGEST}" != "None"
+          echo "digest=${IMAGE_DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "Release image: ${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+
+      - name: Fail on CRITICAL vulnerabilities in the exact release digest
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.image.outputs.repository }}@${{ steps.release-image.outputs.digest }}
+          format: table
+          severity: CRITICAL
+          exit-code: "1"
+          vuln-type: os,library
+
+  deploy:
+    name: Approved Helm deployment
+    needs: build-and-push
+
+    # Required reviewers are configured in GitHub Settings -> Environments.
+    environment:
+      name: cell-01-production
+
+    # This runner is inside a private management/application network. A
+    # GitHub-hosted runner cannot and must not reach the private K3s API.
+    runs-on:
+      - self-hosted
+      - linux
+      - cell-01
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      KUBECONFIG: ${{ vars.KUBECONFIG_PATH }}
+      KUBE_CONTEXT: ${{ vars.KUBE_CONTEXT }}
+      RDS_ENDPOINT: ${{ vars.RDS_ENDPOINT }}
+      ECR_REGISTRY: ${{ needs.build-and-push.outputs.ecr_registry }}
+      IMAGE_REPOSITORY: ${{ needs.build-and-push.outputs.image_repository }}
+      IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+      IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@v5.1.0
+
+      - name: Assume the approved deploy role through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}-deploy
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4.3.1
+
+      - name: Verify private cluster context and release image
+        run: |
+          test -r "${KUBECONFIG}"
+          test -n "${RDS_ENDPOINT}"
+          kubectl config use-context "${KUBE_CONTEXT}"
+          kubectl auth can-i get deployments --namespace "${KUBE_NAMESPACE}" | grep -qx yes
+          aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids "imageDigest=${IMAGE_DIGEST}" >/dev/null
+
+      - name: Refresh the short-lived ECR pull secret
+        run: |
+          kubectl create namespace "${KUBE_NAMESPACE}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          ECR_PASSWORD="$(aws ecr get-login-password --region "${AWS_REGION}")"
+          ECR_AUTH="$(printf 'AWS:%s' "${ECR_PASSWORD}" | base64 -w0)"
+          ECR_CONFIG="$(mktemp)"
+          trap 'rm -f "${ECR_CONFIG}"' EXIT
+          chmod 600 "${ECR_CONFIG}"
+
+          printf '{"auths":{"%s":{"username":"AWS","password":"%s","auth":"%s"}}}' \
+            "${ECR_REGISTRY}" "${ECR_PASSWORD}" "${ECR_AUTH}" > "${ECR_CONFIG}"
+
+          kubectl create secret generic ecr-registry-credentials \
+            --namespace "${KUBE_NAMESPACE}" \
+            --type kubernetes.io/dockerconfigjson \
+            --from-file=.dockerconfigjson="${ECR_CONFIG}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          unset ECR_PASSWORD ECR_AUTH
+
+      - name: Verify externally managed prerequisites
+        run: |
+          kubectl get secret billing-service-secrets --namespace "${KUBE_NAMESPACE}" >/dev/null
+          kubectl get configmap rds-ca-bundle --namespace "${KUBE_NAMESPACE}" >/dev/null
+
+      - name: Deploy billing-service atomically
+        run: |
+          helm upgrade --install "${HELM_RELEASE}" charts/billing-service \
+            --namespace "${KUBE_NAMESPACE}" \
+            --values charts/billing-service/values.production.yaml \
+            --set-string image.repository="${IMAGE_REPOSITORY}" \
+            --set-string image.tag="${IMAGE_TAG}" \
+            --set-string image.digest="${IMAGE_DIGEST}" \
+            --set-string env.dbHost="${RDS_ENDPOINT}" \
+            --atomic \
+            --cleanup-on-fail \
+            --wait \
+            --timeout 5m \
+            --history-max 10
+
+      - name: Verify rollout
+        run: |
+          kubectl rollout status \
+            "deployment/${HELM_RELEASE}-billing-service" \
+            --namespace "${KUBE_NAMESPACE}" \
+            --timeout 2m

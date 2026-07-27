@@ -1,0 +1,20 @@
+node_modules/
+dist/
+
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.plans/
+
+# Backend/account values and real variable values are environment-specific.
+terraform/backend.hcl
+*.tfvars
+!terraform/terraform.tfvars.example
+
+# Audit files are uploaded to controlled storage and are not source code.
+audit/
+
+.env
+.DS_Store
+npm-debug.log

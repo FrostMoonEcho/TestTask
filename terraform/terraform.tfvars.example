@@ -1,0 +1,15 @@
+aws_region  = "eu-central-1"
+environment = "cell-01"
+customer_id = "customer-001"
+tier        = "enterprise"
+
+github_repository  = "example-org/DevOps-Test"
+github_branch      = "main"
+github_environment = "cell-01-production"
+
+# The API remains private. Replace this with the private management/deploy
+# runner subnet or a VPN CIDR; never use 0.0.0.0/0.
+k3s_api_allowed_cidrs = ["10.100.11.0/24"]
+
+rds_multi_az            = true
+rds_deletion_protection = true

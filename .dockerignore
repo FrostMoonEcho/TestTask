@@ -1,0 +1,13 @@
+.git
+.github
+.terraform
+audit
+docs
+scripts
+terraform
+charts
+*.tfstate
+*.tfplan
+*.zip
+node_modules
+npm-debug.log

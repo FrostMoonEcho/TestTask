@@ -1,0 +1,8 @@
+# Copy to backend.hcl and replace the placeholders before terraform init.
+# The state bucket and lock table are bootstrap resources outside this stack.
+bucket         = "acme-platform-terraform-state-ACCOUNT_ID"
+key            = "cells/cell-01/terraform.tfstate"
+region         = "eu-central-1"
+encrypt        = true
+use_lockfile   = true
+dynamodb_table = "acme-platform-terraform-locks"
